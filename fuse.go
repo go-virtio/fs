@@ -1,4 +1,4 @@
-// go-virtio/fs — the FUSE request path and the read-only mount op
+// go-virtio/fs — the FUSE request path and the read-write mount op
 // closure. Each FUSE request is one descriptor chain on the request
 // virtqueue (Virtio 1.2 §5.11.6 "Device Operation"):
 //
@@ -9,6 +9,10 @@
 // buffer, the writable bytes (out-header + out-args, sized to the
 // expected reply) into another, rings the doorbell, busy-polls the used
 // ring, then reads fuse_out_header.error and the op-specific reply.
+//
+// FUSE_WRITE is the single exception: its request inserts an extra
+// readable data descriptor between the in-args and the writable reply (a
+// three-region chain, built by writeRequest).
 //
 // References:
 //
@@ -138,7 +142,7 @@ func (f *VirtioFS) Init() error {
 	le.PutUint32(in[0:4], FuseKernelVersion)      // major
 	le.PutUint32(in[4:8], FuseKernelMinorVersion) // minor
 	le.PutUint32(in[8:12], 0)                     // max_readahead
-	le.PutUint32(in[12:16], 0)                    // flags
+	le.PutUint32(in[12:16], FuseInitFlags)        // flags (write-relevant)
 	// flags2 + unused[11] stay zero.
 
 	out, _, err := f.fuseRequest(FuseOpInit, 0, in, fuseInitOutSize)
@@ -155,6 +159,13 @@ func (f *VirtioFS) Init() error {
 	}
 	f.FuseMajor = major
 	f.FuseMinor = minor
+	// fuse_init_out.flags is at offset 12 (after major,minor,max_readahead).
+	// The negotiated set is what we proposed AND the device offered. A
+	// device that returns a truncated reply (no flags field) negotiates
+	// nothing.
+	if len(out) >= 16 {
+		f.FuseFlags = FuseInitFlags & le.Uint32(out[12:16])
+	}
 	return nil
 }
 
@@ -200,12 +211,23 @@ func (f *VirtioFS) GetAttr(nodeid uint64) (Attr, error) {
 	return ParseAttr(out[16 : 16+fuseAttrSize]), nil
 }
 
-// Open performs FUSE_OPEN (Linux fuse.h, opcode 14) on `nodeid`. The
-// in-args are fuse_open_in{flags, open_flags}; the driver opens
-// read-only (flags = O_RDONLY = 0). The reply is fuse_open_out{fh,
-// open_flags, backing_id}; the returned fh is used in Read/Release.
+// Open performs FUSE_OPEN (Linux fuse.h, opcode 14) on `nodeid`,
+// read-only. It is unchanged from the read-only closure (flags =
+// O_RDONLY); the returned fh is used in Read/Release.
 func (f *VirtioFS) Open(nodeid uint64) (uint64, error) {
-	in := make([]byte, fuseOpenInSize) // flags=0 (O_RDONLY), open_flags=0
+	return f.OpenRW(nodeid, OpenReadOnly)
+}
+
+// OpenRW performs FUSE_OPEN (Linux fuse.h, opcode 14) on `nodeid` with an
+// explicit access mode in `flags` (OpenReadOnly / OpenWriteOnly /
+// OpenReadWrite, optionally OR-ed with other open(2) flags such as
+// O_TRUNC). The in-args are fuse_open_in{flags, open_flags}; the reply is
+// fuse_open_out{fh, open_flags, backing_id}; the returned fh is used in
+// Read/Write/Fsync/Flush/Release.
+func (f *VirtioFS) OpenRW(nodeid uint64, flags uint32) (uint64, error) {
+	in := make([]byte, fuseOpenInSize)
+	le.PutUint32(in[0:4], flags) // fuse_open_in.flags (O_RDONLY/WRONLY/RDWR)
+	le.PutUint32(in[4:8], 0)     // open_flags
 	out, _, err := f.fuseRequest(FuseOpOpen, nodeid, in, fuseOpenOutSize)
 	if err != nil {
 		return 0, err
@@ -249,6 +271,350 @@ func (f *VirtioFS) Release(nodeid, fh uint64) error {
 	in := make([]byte, fuseReleaseInSize)
 	le.PutUint64(in[0:8], fh) // fh; flags/release_flags/lock_owner = 0
 	_, _, err := f.fuseRequest(FuseOpRelease, nodeid, in, 0)
+	return err
+}
+
+// Write performs FUSE_WRITE (Linux fuse.h, opcode 16) on (nodeid, fh),
+// writing `data` at byte offset `off`. The request is a THREE-region
+// chain (Virtio 1.2 §5.11.6): readable [fuse_in_header | fuse_write_in],
+// readable [data], writable [fuse_out_header | fuse_write_out]. The reply
+// fuse_write_out{size, padding} reports the bytes the device accepted;
+// Write returns that count and ErrShortWrite if it is less than
+// len(data).
+//
+// fuse_write_in (Linux fuse.h): fh, offset, size, write_flags,
+// lock_owner, flags, padding.
+func (f *VirtioFS) Write(nodeid, fh, off uint64, data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, ErrZeroSize
+	}
+	wi := make([]byte, fuseWriteInSize)
+	le.PutUint64(wi[0:8], fh)                  // fh
+	le.PutUint64(wi[8:16], off)                // offset
+	le.PutUint32(wi[16:20], uint32(len(data))) // size
+	le.PutUint32(wi[20:24], 0)                 // write_flags
+	le.PutUint64(wi[24:32], 0)                 // lock_owner
+	le.PutUint32(wi[32:36], 0)                 // flags
+	le.PutUint32(wi[36:40], 0)                 // padding
+
+	out, _, err := f.writeRequest(nodeid, wi, data, fuseWriteOutSize)
+	if err != nil {
+		return 0, err
+	}
+	if len(out) < fuseWriteOutSize {
+		return 0, ErrShortReply
+	}
+	n := int(le.Uint32(out[0:4])) // fuse_write_out.size
+	if n < len(data) {
+		return n, ErrShortWrite
+	}
+	return n, nil
+}
+
+// writeRequest performs one FUSE round-trip whose request carries an
+// extra readable data region between the in-header+in-args and the
+// writable reply (the FUSE_WRITE shape). `inArgs` is the op-specific
+// in-args (fuse_write_in) appended after the fuse_in_header; `data` is
+// the payload region; `outArgsLen` sizes the writable out-args. The
+// fuse_in_header.len covers header + inArgs + data (the device reads the
+// data as part of the request).
+func (f *VirtioFS) writeRequest(nodeid uint64, inArgs, data []byte, outArgsLen int) ([]byte, int32, error) {
+	inLen := fuseInHeaderSize + len(inArgs)
+	outLen := fuseOutHeaderSize + outArgsLen
+
+	inPhys, inMem, err := f.allocBytes(inLen)
+	if err != nil {
+		return nil, 0, err
+	}
+	unique := f.nextUnique()
+	// fuse_in_header.len is the TOTAL request length the device reads:
+	// header + in-args + the data region (Linux fuse.h).
+	le.PutUint32(inMem[0:4], uint32(inLen+len(data)))
+	le.PutUint32(inMem[4:8], FuseOpWrite)
+	le.PutUint64(inMem[8:16], unique)
+	le.PutUint64(inMem[16:24], nodeid)
+	le.PutUint32(inMem[24:28], 0) // uid
+	le.PutUint32(inMem[28:32], 0) // gid
+	le.PutUint32(inMem[32:36], 0) // pid
+	le.PutUint16(inMem[36:38], 0) // total_extlen
+	le.PutUint16(inMem[38:40], 0) // padding
+	copy(inMem[fuseInHeaderSize:inLen], inArgs)
+
+	dataPhys, dataMem, err := f.allocBytes(len(data))
+	if err != nil {
+		return nil, 0, err
+	}
+	copy(dataMem[:len(data)], data)
+
+	outPhys, outMem, err := f.allocBytes(outLen)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	chain := []common.ChainBuffer{
+		{Addr: uintptr(inPhys), Phys: inPhys, Len: uint32(inLen), Writable: false},
+		{Addr: uintptr(dataPhys), Phys: dataPhys, Len: uint32(len(data)), Writable: false},
+		{Addr: uintptr(outPhys), Phys: outPhys, Len: uint32(outLen), Writable: true},
+	}
+
+	head, err := f.rq.AddChain(chain)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := f.Cfg.NotifyQueue(RequestQueueIdx, f.rq.NotifyOff); err != nil {
+		return nil, 0, err
+	}
+
+	for spin := 0; spin < TxPollIterations; spin++ {
+		gotIdx, _, ok := f.rq.PollUsed()
+		if !ok {
+			continue
+		}
+		_ = f.rq.ReclaimChain(gotIdx)
+		replyLen := le.Uint32(outMem[0:4])
+		ferr := int32(le.Uint32(outMem[4:8]))
+		if ferr != 0 {
+			return nil, ferr, ErrFuseError
+		}
+		got := int(replyLen) - fuseOutHeaderSize
+		if got < 0 {
+			got = 0
+		}
+		if got > outArgsLen {
+			got = outArgsLen
+		}
+		o := make([]byte, got)
+		copy(o, outMem[fuseOutHeaderSize:fuseOutHeaderSize+got])
+		return o, 0, nil
+	}
+	_ = f.rq.ReclaimChain(head)
+	return nil, 0, ErrRequestTimeout
+}
+
+// Create performs FUSE_CREATE (Linux fuse.h, opcode 35) in directory
+// `parent`: an atomic create+open of `name` with `mode` (st_mode incl.
+// type/perm bits) and access `flags` (OpenWriteOnly/OpenReadWrite, OR-ed
+// with create-time flags such as O_EXCL). The in-args are
+// fuse_create_in{flags, mode, umask, open_flags} followed by the
+// NUL-terminated name; the reply is fuse_entry_out immediately followed
+// by fuse_open_out. Returns the new Entry and the open file handle.
+func (f *VirtioFS) Create(parent uint64, name string, mode, flags uint32) (Entry, uint64, error) {
+	ci := make([]byte, fuseCreateInSize)
+	le.PutUint32(ci[0:4], flags) // flags (open access mode)
+	le.PutUint32(ci[4:8], mode)  // mode
+	le.PutUint32(ci[8:12], 0)    // umask
+	le.PutUint32(ci[12:16], 0)   // open_flags
+	in := append(ci, append([]byte(name), 0)...)
+	out, _, err := f.fuseRequest(FuseOpCreate, parent, in, fuseEntryOutSize+fuseOpenOutSize)
+	if err != nil {
+		return Entry{}, 0, err
+	}
+	if len(out) < fuseEntryOutSize+fuseOpenOutSize {
+		return Entry{}, 0, ErrShortReply
+	}
+	nodeid := le.Uint64(out[0:8])
+	attr := ParseAttr(out[40 : 40+fuseAttrSize])
+	// fuse_open_out follows the 132-byte fuse_entry_out; its fh is at +0.
+	fh := le.Uint64(out[fuseEntryOutSize : fuseEntryOutSize+8])
+	return Entry{NodeID: nodeid, Attr: attr}, fh, nil
+}
+
+// Mkdir performs FUSE_MKDIR (Linux fuse.h, opcode 9) in directory
+// `parent`, creating subdirectory `name` with permission bits `mode`.
+// The in-args are fuse_mkdir_in{mode, umask} followed by the
+// NUL-terminated name; the reply is fuse_entry_out for the new directory.
+func (f *VirtioFS) Mkdir(parent uint64, name string, mode uint32) (Entry, error) {
+	mi := make([]byte, fuseMkdirInSize)
+	le.PutUint32(mi[0:4], mode) // mode
+	le.PutUint32(mi[4:8], 0)    // umask
+	in := append(mi, append([]byte(name), 0)...)
+	out, _, err := f.fuseRequest(FuseOpMkdir, parent, in, fuseEntryOutSize)
+	if err != nil {
+		return Entry{}, err
+	}
+	if len(out) < fuseEntryOutSize {
+		return Entry{}, ErrShortReply
+	}
+	nodeid := le.Uint64(out[0:8])
+	if nodeid == 0 {
+		return Entry{}, ErrNoEntry
+	}
+	attr := ParseAttr(out[40 : 40+fuseAttrSize])
+	return Entry{NodeID: nodeid, Attr: attr}, nil
+}
+
+// Mknod performs FUSE_MKNOD (Linux fuse.h, opcode 8) in directory
+// `parent`, creating a non-directory node `name` with st_mode `mode`
+// (type bits select regular file / fifo / socket / device) and device
+// number `rdev` (0 for non-device nodes). The in-args are
+// fuse_mknod_in{mode, rdev, umask, padding} followed by the
+// NUL-terminated name; the reply is fuse_entry_out.
+func (f *VirtioFS) Mknod(parent uint64, name string, mode, rdev uint32) (Entry, error) {
+	mi := make([]byte, fuseMknodInSize)
+	le.PutUint32(mi[0:4], mode) // mode
+	le.PutUint32(mi[4:8], rdev) // rdev
+	le.PutUint32(mi[8:12], 0)   // umask
+	le.PutUint32(mi[12:16], 0)  // padding
+	in := append(mi, append([]byte(name), 0)...)
+	out, _, err := f.fuseRequest(FuseOpMknod, parent, in, fuseEntryOutSize)
+	if err != nil {
+		return Entry{}, err
+	}
+	if len(out) < fuseEntryOutSize {
+		return Entry{}, ErrShortReply
+	}
+	nodeid := le.Uint64(out[0:8])
+	if nodeid == 0 {
+		return Entry{}, ErrNoEntry
+	}
+	attr := ParseAttr(out[40 : 40+fuseAttrSize])
+	return Entry{NodeID: nodeid, Attr: attr}, nil
+}
+
+// Symlink performs FUSE_SYMLINK (Linux fuse.h, opcode 6) in directory
+// `parent`, creating symlink `name` whose target is `target`. FUSE_SYMLINK
+// has no fixed in-args struct: the in-args are the NUL-terminated link
+// name followed by the NUL-terminated target. The reply is fuse_entry_out.
+func (f *VirtioFS) Symlink(parent uint64, name, target string) (Entry, error) {
+	in := append([]byte(name), 0)
+	in = append(in, append([]byte(target), 0)...)
+	out, _, err := f.fuseRequest(FuseOpSymlink, parent, in, fuseEntryOutSize)
+	if err != nil {
+		return Entry{}, err
+	}
+	if len(out) < fuseEntryOutSize {
+		return Entry{}, ErrShortReply
+	}
+	nodeid := le.Uint64(out[0:8])
+	if nodeid == 0 {
+		return Entry{}, ErrNoEntry
+	}
+	attr := ParseAttr(out[40 : 40+fuseAttrSize])
+	return Entry{NodeID: nodeid, Attr: attr}, nil
+}
+
+// Link performs FUSE_LINK (Linux fuse.h, opcode 13): create a hard link
+// `newname` in directory `newparent` pointing at the existing node
+// `oldnodeid`. The in-args are fuse_link_in{oldnodeid} followed by the
+// NUL-terminated new name; the reply is fuse_entry_out.
+func (f *VirtioFS) Link(oldnodeid, newparent uint64, newname string) (Entry, error) {
+	li := make([]byte, fuseLinkInSize)
+	le.PutUint64(li[0:8], oldnodeid) // oldnodeid
+	in := append(li, append([]byte(newname), 0)...)
+	out, _, err := f.fuseRequest(FuseOpLink, newparent, in, fuseEntryOutSize)
+	if err != nil {
+		return Entry{}, err
+	}
+	if len(out) < fuseEntryOutSize {
+		return Entry{}, ErrShortReply
+	}
+	nodeid := le.Uint64(out[0:8])
+	if nodeid == 0 {
+		return Entry{}, ErrNoEntry
+	}
+	attr := ParseAttr(out[40 : 40+fuseAttrSize])
+	return Entry{NodeID: nodeid, Attr: attr}, nil
+}
+
+// SetAttrIn carries the fuse_setattr_in fields the caller wants to
+// change for SetAttr. Only fields flagged in Valid (FATTR_* bits) are
+// applied by the device; the others are ignored.
+type SetAttrIn struct {
+	Valid uint32 // FATTR_* mask selecting which fields below are live
+	Fh    uint64 // open handle (only if FattrFh set in Valid)
+	Size  uint64 // new size (truncate; FattrSize)
+	Mode  uint32 // new st_mode (chmod; FattrMode)
+	UID   uint32 // new owner uid (FattrUID)
+	GID   uint32 // new owner gid (FattrGID)
+	Atime uint64 // access time, seconds (FattrAtime)
+	Mtime uint64 // modify time, seconds (FattrMtime)
+}
+
+// SetAttr performs FUSE_SETATTR (Linux fuse.h, opcode 4) on `nodeid`,
+// changing the attributes selected by in.Valid (truncate via FattrSize,
+// chmod via FattrMode, chown via FattrUID/FattrGID, utimes via
+// FattrAtime/FattrMtime, etc.). The in-args are fuse_setattr_in; the
+// reply is fuse_attr_out, returned as the updated Attr.
+func (f *VirtioFS) SetAttr(nodeid uint64, in SetAttrIn) (Attr, error) {
+	si := make([]byte, fuseSetattrInSize)
+	le.PutUint32(si[setattrValidOffset:setattrValidOffset+4], in.Valid)
+	le.PutUint64(si[setattrFhOffset:setattrFhOffset+8], in.Fh)
+	le.PutUint64(si[setattrSizeOffset:setattrSizeOffset+8], in.Size)
+	le.PutUint64(si[setattrAtimeOffset:setattrAtimeOffset+8], in.Atime)
+	le.PutUint64(si[setattrMtimeOffset:setattrMtimeOffset+8], in.Mtime)
+	le.PutUint32(si[setattrModeOffset:setattrModeOffset+4], in.Mode)
+	le.PutUint32(si[setattrUIDOffset:setattrUIDOffset+4], in.UID)
+	le.PutUint32(si[setattrGIDOffset:setattrGIDOffset+4], in.GID)
+	out, _, err := f.fuseRequest(FuseOpSetattr, nodeid, si, fuseAttrOutSize)
+	if err != nil {
+		return Attr{}, err
+	}
+	if len(out) < fuseAttrOutSize {
+		return Attr{}, ErrShortReply
+	}
+	// fuse_attr_out: attr_valid(0), attr_valid_nsec(8), dummy(12), then
+	// fuse_attr at offset 16 (same layout as GetAttr's reply).
+	return ParseAttr(out[16 : 16+fuseAttrSize]), nil
+}
+
+// Unlink performs FUSE_UNLINK (Linux fuse.h, opcode 10): remove the
+// non-directory entry `name` from directory `parent`. The in-args are
+// the NUL-terminated name; the reply is error-only (no out-args).
+func (f *VirtioFS) Unlink(parent uint64, name string) error {
+	in := append([]byte(name), 0)
+	_, _, err := f.fuseRequest(FuseOpUnlink, parent, in, 0)
+	return err
+}
+
+// Rmdir performs FUSE_RMDIR (Linux fuse.h, opcode 11): remove the empty
+// subdirectory `name` from directory `parent`. The in-args are the
+// NUL-terminated name; the reply is error-only.
+func (f *VirtioFS) Rmdir(parent uint64, name string) error {
+	in := append([]byte(name), 0)
+	_, _, err := f.fuseRequest(FuseOpRmdir, parent, in, 0)
+	return err
+}
+
+// Rename performs FUSE_RENAME (Linux fuse.h, opcode 12): move/rename
+// `oldname` in directory `oldparent` to `newname` in directory
+// `newparent`. The in-args are fuse_rename_in{newdir} followed by the
+// NUL-terminated oldname and the NUL-terminated newname; the reply is
+// error-only.
+func (f *VirtioFS) Rename(oldparent uint64, oldname string, newparent uint64, newname string) error {
+	ri := make([]byte, fuseRenameInSize)
+	le.PutUint64(ri[0:8], newparent) // newdir
+	in := append(ri, append([]byte(oldname), 0)...)
+	in = append(in, append([]byte(newname), 0)...)
+	_, _, err := f.fuseRequest(FuseOpRename, oldparent, in, 0)
+	return err
+}
+
+// Fsync performs FUSE_FSYNC (Linux fuse.h, opcode 20) on (nodeid, fh),
+// flushing the file's data (and, unless datasync, metadata) to stable
+// storage. `datasync` true sets fsync_flags bit 0 (FUSE_FSYNC_FDATASYNC).
+// The in-args are fuse_fsync_in{fh, fsync_flags, padding}; error-only reply.
+func (f *VirtioFS) Fsync(nodeid, fh uint64, datasync bool) error {
+	fi := make([]byte, fuseFsyncInSize)
+	le.PutUint64(fi[0:8], fh) // fh
+	if datasync {
+		le.PutUint32(fi[8:12], 1) // fsync_flags: FUSE_FSYNC_FDATASYNC (bit 0)
+	}
+	le.PutUint32(fi[12:16], 0) // padding
+	_, _, err := f.fuseRequest(FuseOpFsync, nodeid, fi, 0)
+	return err
+}
+
+// Flush performs FUSE_FLUSH (Linux fuse.h, opcode 25) on (nodeid, fh),
+// issued on each close(2) of a duplicated handle (one per open). The
+// in-args are fuse_flush_in{fh, unused, padding, lock_owner}; error-only
+// reply.
+func (f *VirtioFS) Flush(nodeid, fh uint64) error {
+	fi := make([]byte, fuseFlushInSize)
+	le.PutUint64(fi[0:8], fh)  // fh
+	le.PutUint32(fi[8:12], 0)  // unused
+	le.PutUint32(fi[12:16], 0) // padding
+	le.PutUint64(fi[16:24], 0) // lock_owner
+	_, _, err := f.fuseRequest(FuseOpFlush, nodeid, fi, 0)
 	return err
 }
 
@@ -333,7 +699,8 @@ var (
 	ErrFuseVersion       = fsError("go-virtio/fs: device FUSE major version is not 7")
 	ErrShortReply        = fsError("go-virtio/fs: device wrote fewer reply bytes than the op requires")
 	ErrNoEntry           = fsError("go-virtio/fs: FUSE_LOOKUP returned nodeid 0 (no such entry)")
-	ErrZeroSize          = fsError("go-virtio/fs: Read size must be positive")
+	ErrZeroSize          = fsError("go-virtio/fs: Read/Write size must be positive")
+	ErrShortWrite        = fsError("go-virtio/fs: device accepted fewer bytes than requested (short write)")
 )
 
 // fsError is the package's tiny sentinel-error type.

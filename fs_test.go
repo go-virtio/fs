@@ -82,9 +82,12 @@ type fakeFSDevice struct {
 	forceMajor      int32  // -1 => echo FuseKernelVersion; >=0 => force this major
 	lookupNodeID    uint64 // nodeid Lookup returns (0 => negative)
 	openFH          uint64
-	shortReply      bool // truncate out-args (replyLen too small)
-	noReplyLenField bool // leave replyLen=0 to exercise got<0 clamp
-	overlongRead    bool // claim replyLen > buffer (exercise got>outArgsLen clamp)
+	createNodeID    uint64 // nodeid Create/Mkdir/Mknod/Symlink/Link return
+	writeAccept     int32  // bytes the device "accepts" for a write; -1 => echo size
+	lastWriteData   []byte // captured FUSE_WRITE data region (for verification)
+	shortReply      bool   // truncate out-args (replyLen too small)
+	noReplyLenField bool   // leave replyLen=0 to exercise got<0 clamp
+	overlongRead    bool   // claim replyLen > buffer (exercise got>outArgsLen clamp)
 
 	reqConsumed map[uint16]uint16
 
@@ -109,6 +112,8 @@ func newFakeFSDevice(deviceFeats uint64) *fakeFSDevice {
 		forceMajor:     -1,
 		lookupNodeID:   2,
 		openFH:         42,
+		createNodeID:   3,
+		writeAccept:    -1,
 		reqConsumed:    map[uint16]uint16{},
 	}
 	d.cfg = buildVirtioFSCfgSpace()
@@ -386,7 +391,7 @@ func (d *fakeFSDevice) handleRequest() {
 
 	usedLen := uint32(0)
 	if outDesc != nil {
-		usedLen = d.writeReply(op, nodeid, inBuf, outDesc)
+		usedLen = d.writeReply(op, nodeid, inBuf, outDesc, descs)
 	}
 
 	usedSlice := sliceAt(usedAddr, 4+8*int(size))
@@ -402,7 +407,7 @@ func (d *fakeFSDevice) handleRequest() {
 // writeReply fills the writable descriptor with fuse_out_header +
 // op-specific out-args and returns the total bytes written (used-ring
 // len). Honours d.fuseErrno / d.shortReply / d.noReplyLenField.
-func (d *fakeFSDevice) writeReply(op uint32, nodeid uint64, inBuf []byte, outDesc *fakeDesc) uint32 {
+func (d *fakeFSDevice) writeReply(op uint32, nodeid uint64, inBuf []byte, outDesc *fakeDesc, descs []fakeDesc) uint32 {
 	out := sliceAt(outDesc.addr, int(outDesc.length))
 	unique := le.Uint64(inBuf[8:16])
 
@@ -417,6 +422,8 @@ func (d *fakeFSDevice) writeReply(op uint32, nodeid uint64, inBuf []byte, outDes
 	var args []byte
 	switch op {
 	case FuseOpInit:
+		// Echo a full fuse_init_out prefix: major, minor, max_readahead,
+		// flags. flags at offset 12 lets the driver record FuseFlags.
 		args = make([]byte, 16)
 		major := FuseKernelVersion
 		if d.forceMajor >= 0 {
@@ -424,6 +431,8 @@ func (d *fakeFSDevice) writeReply(op uint32, nodeid uint64, inBuf []byte, outDes
 		}
 		le.PutUint32(args[0:4], major)
 		le.PutUint32(args[4:8], FuseKernelMinorVersion)
+		le.PutUint32(args[8:12], 0)              // max_readahead
+		le.PutUint32(args[12:16], FuseInitFlags) // offer everything proposed
 	case FuseOpLookup:
 		args = make([]byte, fuseEntryOutSize)
 		le.PutUint64(args[0:8], d.lookupNodeID)
@@ -450,8 +459,38 @@ func (d *fakeFSDevice) writeReply(op uint32, nodeid uint64, inBuf []byte, outDes
 			chunk = content[off:end]
 		}
 		args = chunk
-	case FuseOpRelease, FuseOpDestroy:
-		args = nil // no out-args
+	case FuseOpWrite:
+		// The data region is the second readable descriptor (descs[1]).
+		// fuse_write_in.size is at in-args offset 16.
+		reqSize := le.Uint32(inBuf[fuseInHeaderSize+16 : fuseInHeaderSize+20])
+		if len(descs) >= 2 {
+			dataDesc := descs[1]
+			d.lastWriteData = append([]byte(nil), sliceAt(dataDesc.addr, int(dataDesc.length))...)
+		}
+		accepted := reqSize
+		if d.writeAccept >= 0 {
+			accepted = uint32(d.writeAccept)
+		}
+		args = make([]byte, fuseWriteOutSize)
+		le.PutUint32(args[0:4], accepted) // fuse_write_out.size
+	case FuseOpCreate:
+		// fuse_entry_out (132) immediately followed by fuse_open_out (16).
+		args = make([]byte, fuseEntryOutSize+fuseOpenOutSize)
+		le.PutUint64(args[0:8], d.createNodeID)
+		d.fillAttr(args[40:40+fuseAttrSize], d.createNodeID, 0, 0o100644)
+		le.PutUint64(args[fuseEntryOutSize:fuseEntryOutSize+8], d.openFH)
+	case FuseOpMkdir, FuseOpMknod, FuseOpSymlink, FuseOpLink:
+		args = make([]byte, fuseEntryOutSize)
+		le.PutUint64(args[0:8], d.createNodeID)
+		d.fillAttr(args[40:40+fuseAttrSize], d.createNodeID, 0, 0o040755)
+	case FuseOpSetattr:
+		args = make([]byte, fuseAttrOutSize)
+		// Echo the requested size/mode back in the attr (offset 16).
+		newSize := le.Uint64(inBuf[fuseInHeaderSize+setattrSizeOffset : fuseInHeaderSize+setattrSizeOffset+8])
+		newMode := le.Uint32(inBuf[fuseInHeaderSize+setattrModeOffset : fuseInHeaderSize+setattrModeOffset+4])
+		d.fillAttr(args[16:16+fuseAttrSize], nodeid, newSize, newMode)
+	case FuseOpRelease, FuseOpDestroy, FuseOpUnlink, FuseOpRmdir, FuseOpRename, FuseOpFsync, FuseOpFlush:
+		args = nil // no out-args (error-only reply)
 	default:
 		args = nil
 	}
@@ -848,6 +887,438 @@ func TestForget_RoundTrip(t *testing.T) {
 	v := openFS(t, d)
 	if err := v.Forget(2, 1); err != nil {
 		t.Errorf("Forget: %v", err)
+	}
+}
+
+// --- read-write closure round-trips -----------------------------------
+
+func TestInit_NegotiatesFuseFlags(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if v.FuseFlags != FuseInitFlags {
+		t.Errorf("FuseFlags: got 0x%x, want 0x%x", v.FuseFlags, FuseInitFlags)
+	}
+	if FuseInitFlags&FuseWritebackCach != 0 {
+		t.Error("FuseWritebackCach must not be proposed")
+	}
+}
+
+func TestOpenRW_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.openFH = 77
+	v := openFS(t, d)
+	fh, err := v.OpenRW(2, OpenReadWrite)
+	if err != nil {
+		t.Fatalf("OpenRW: %v", err)
+	}
+	if fh != 77 {
+		t.Errorf("fh: got %d, want 77", fh)
+	}
+}
+
+func TestOpenRW_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.OpenRW(2, OpenWriteOnly); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	data := []byte("hello write path")
+	n, err := v.Write(2, 42, 8, data)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("n: got %d, want %d", n, len(data))
+	}
+	if !bytes.Equal(d.lastWriteData, data) {
+		t.Errorf("device data region: got %q, want %q", d.lastWriteData, data)
+	}
+}
+
+func TestWrite_ZeroSize(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if _, err := v.Write(2, 42, 0, nil); !errors.Is(err, ErrZeroSize) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_ShortWrite(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.writeAccept = 2 // accept fewer than requested
+	v := openFS(t, d)
+	n, err := v.Write(2, 42, 0, []byte("abcdef"))
+	if !errors.Is(err, ErrShortWrite) {
+		t.Errorf("got %v", err)
+	}
+	if n != 2 {
+		t.Errorf("n: got %d, want 2", n)
+	}
+}
+
+func TestWrite_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -28 // -ENOSPC
+	v := openFS(t, d)
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestCreate_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 9
+	d.openFH = 55
+	v := openFS(t, d)
+	e, fh, err := v.Create(1, "new.txt", 0o100644, OpenReadWrite)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if e.NodeID != 9 || fh != 55 {
+		t.Errorf("Create: nodeid=%d fh=%d, want 9/55", e.NodeID, fh)
+	}
+	if e.Attr.Mode != 0o100644 {
+		t.Errorf("Attr.Mode: got 0o%o", e.Attr.Mode)
+	}
+}
+
+func TestCreate_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, _, err := v.Create(1, "x", 0o100644, OpenWriteOnly); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestCreate_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -17 // -EEXIST
+	v := openFS(t, d)
+	if _, _, err := v.Create(1, "x", 0o100644, 0); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMkdir_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 11
+	v := openFS(t, d)
+	e, err := v.Mkdir(1, "sub", 0o755)
+	if err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if e.NodeID != 11 {
+		t.Errorf("NodeID: got %d, want 11", e.NodeID)
+	}
+}
+
+func TestMkdir_NegativeEntry(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 0
+	v := openFS(t, d)
+	if _, err := v.Mkdir(1, "sub", 0o755); !errors.Is(err, ErrNoEntry) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMkdir_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.Mkdir(1, "sub", 0o755); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMkdir_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -13
+	v := openFS(t, d)
+	if _, err := v.Mkdir(1, "sub", 0o755); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMknod_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 12
+	v := openFS(t, d)
+	e, err := v.Mknod(1, "fifo", 0o010644, 0)
+	if err != nil {
+		t.Fatalf("Mknod: %v", err)
+	}
+	if e.NodeID != 12 {
+		t.Errorf("NodeID: got %d, want 12", e.NodeID)
+	}
+}
+
+func TestMknod_NegativeEntry(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 0
+	v := openFS(t, d)
+	if _, err := v.Mknod(1, "fifo", 0o010644, 0); !errors.Is(err, ErrNoEntry) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMknod_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.Mknod(1, "fifo", 0o010644, 0); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestMknod_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -1
+	v := openFS(t, d)
+	if _, err := v.Mknod(1, "fifo", 0o010644, 0); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSymlink_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 13
+	v := openFS(t, d)
+	e, err := v.Symlink(1, "lnk", "/target/path")
+	if err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if e.NodeID != 13 {
+		t.Errorf("NodeID: got %d, want 13", e.NodeID)
+	}
+}
+
+func TestSymlink_NegativeEntry(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 0
+	v := openFS(t, d)
+	if _, err := v.Symlink(1, "lnk", "t"); !errors.Is(err, ErrNoEntry) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSymlink_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.Symlink(1, "lnk", "t"); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSymlink_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -13
+	v := openFS(t, d)
+	if _, err := v.Symlink(1, "lnk", "t"); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestLink_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 2 // hard link to existing node
+	v := openFS(t, d)
+	e, err := v.Link(2, 1, "alias")
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if e.NodeID != 2 {
+		t.Errorf("NodeID: got %d, want 2", e.NodeID)
+	}
+}
+
+func TestLink_NegativeEntry(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.createNodeID = 0
+	v := openFS(t, d)
+	if _, err := v.Link(2, 1, "alias"); !errors.Is(err, ErrNoEntry) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestLink_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.Link(2, 1, "alias"); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestLink_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -31 // -EMLINK
+	v := openFS(t, d)
+	if _, err := v.Link(2, 1, "alias"); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSetAttr_Truncate(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	a, err := v.SetAttr(2, SetAttrIn{Valid: FattrSize, Size: 4096})
+	if err != nil {
+		t.Fatalf("SetAttr: %v", err)
+	}
+	if a.Size != 4096 {
+		t.Errorf("Size: got %d, want 4096", a.Size)
+	}
+}
+
+func TestSetAttr_ChmodChownUtimes(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	in := SetAttrIn{
+		Valid: FattrMode | FattrUID | FattrGID | FattrAtime | FattrMtime | FattrFh,
+		Fh:    42,
+		Mode:  0o100600,
+		UID:   1000,
+		GID:   1000,
+		Atime: 111,
+		Mtime: 222,
+	}
+	a, err := v.SetAttr(2, in)
+	if err != nil {
+		t.Fatalf("SetAttr: %v", err)
+	}
+	if a.Mode != 0o100600 {
+		t.Errorf("Mode: got 0o%o, want 0o100600", a.Mode)
+	}
+}
+
+func TestSetAttr_ShortReply(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.shortReply = true
+	v := openFS(t, d)
+	if _, err := v.SetAttr(2, SetAttrIn{Valid: FattrSize}); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSetAttr_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -1
+	v := openFS(t, d)
+	if _, err := v.SetAttr(2, SetAttrIn{Valid: FattrMode, Mode: 0o600}); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestUnlink_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Unlink(1, "gone.txt"); err != nil {
+		t.Errorf("Unlink: %v", err)
+	}
+}
+
+func TestUnlink_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -2 // -ENOENT
+	v := openFS(t, d)
+	if err := v.Unlink(1, "gone.txt"); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestRmdir_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Rmdir(1, "sub"); err != nil {
+		t.Errorf("Rmdir: %v", err)
+	}
+}
+
+func TestRmdir_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -39 // -ENOTEMPTY
+	v := openFS(t, d)
+	if err := v.Rmdir(1, "sub"); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestRename_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Rename(1, "old", 5, "new"); err != nil {
+		t.Errorf("Rename: %v", err)
+	}
+}
+
+func TestRename_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -2
+	v := openFS(t, d)
+	if err := v.Rename(1, "old", 5, "new"); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestFsync_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Fsync(2, 42, false); err != nil {
+		t.Errorf("Fsync: %v", err)
+	}
+}
+
+func TestFsync_Datasync(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Fsync(2, 42, true); err != nil {
+		t.Errorf("Fsync datasync: %v", err)
+	}
+}
+
+func TestFsync_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -5
+	v := openFS(t, d)
+	if err := v.Fsync(2, 42, false); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestFlush_RoundTrip(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	if err := v.Flush(2, 42); err != nil {
+		t.Errorf("Flush: %v", err)
+	}
+}
+
+func TestFlush_FuseError(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.fuseErrno = -5
+	v := openFS(t, d)
+	if err := v.Flush(2, 42); !errors.Is(err, ErrFuseError) {
+		t.Errorf("got %v", err)
 	}
 }
 

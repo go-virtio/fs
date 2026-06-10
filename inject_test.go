@@ -278,6 +278,112 @@ func TestForget_AddChainFull(t *testing.T) {
 	}
 }
 
+// --- writeRequest (Write) 3-region-chain injection branches -----------
+
+func TestWrite_AllocInFail(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	it := newInject(d, false)
+	v, _ := OpenVirtioFS(it)
+	it.enable = true
+	it.fp = failPoint{"AllocatePages", 1} // in-header+in-args alloc
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, errInjected) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_AllocInZeroPhys(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	it := newInject(d, false)
+	v, _ := OpenVirtioFS(it)
+	it.enable = true
+	it.zeroPhys = true
+	it.zeroPhysAfter = 0 // first write alloc (in-buffer) returns phys 0
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, common.ErrAllocReturnedZero) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_AllocDataFail(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	it := newInject(d, false)
+	v, _ := OpenVirtioFS(it)
+	it.enable = true
+	it.fp = failPoint{"AllocatePages", 2} // data-region alloc (2nd this req)
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, errInjected) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_AllocOutFail(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	it := newInject(d, false)
+	v, _ := OpenVirtioFS(it)
+	it.enable = true
+	it.fp = failPoint{"AllocatePages", 3} // out-buffer alloc (3rd this req)
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, errInjected) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_NotifyFail(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	it := newInject(d, false)
+	v, _ := OpenVirtioFS(it)
+	it.enable = true
+	it.fp = failPoint{"Write32", 1} // request doorbell write
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, errInjected) {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestWrite_AddChainFull(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	q := v.RequestQueue()
+	phys, _, _ := d.AllocatePages(1)
+	for i := uint16(0); i < q.Layout.Size; i++ {
+		if _, err := q.AddBuffer(uintptr(phys), phys, 16, false); err != nil {
+			t.Fatalf("saturate[%d]: %v", i, err)
+		}
+	}
+	if _, err := v.Write(2, 42, 0, []byte("x")); err == nil {
+		t.Error("expected AddChain queue-full error")
+	}
+}
+
+func TestWrite_Timeout(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	v := openFS(t, d)
+	d.completes = false
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, ErrRequestTimeout) {
+		t.Errorf("got %v", err)
+	}
+}
+
+// TestWrite_NoReplyLenClamp drives writeRequest's got<0 clamp (replyLen=0
+// < fuseOutHeaderSize) so the out slice is empty and Write sees
+// ErrShortReply.
+func TestWrite_NoReplyLenClamp(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.noReplyLenField = true
+	v := openFS(t, d)
+	if _, err := v.Write(2, 42, 0, []byte("x")); !errors.Is(err, ErrShortReply) {
+		t.Errorf("got %v", err)
+	}
+}
+
+// TestWrite_OverlongReplyClamp drives writeRequest's got>outArgsLen clamp.
+func TestWrite_OverlongReplyClamp(t *testing.T) {
+	d := newFakeFSDevice(common.FeatureVersion1)
+	d.overlongRead = true
+	v := openFS(t, d)
+	// overlong makes replyLen huge; got clamps to fuseWriteOutSize so the
+	// reply still parses and reports the accepted size.
+	if _, err := v.Write(2, 42, 0, []byte("abcd")); err != nil {
+		t.Errorf("Write: %v", err)
+	}
+}
+
 // TestRead_OverlongReplyClamp covers fuseRequest's got>outArgsLen clamp:
 // the device claims a replyLen larger than the buffer the driver sized.
 func TestRead_OverlongReplyClamp(t *testing.T) {

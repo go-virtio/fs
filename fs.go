@@ -8,16 +8,19 @@
 // Scope — this package owns device bring-up, the request virtqueue, the
 // FUSE-over-virtio descriptor-chain framing (readable [fuse_in_header |
 // in-args], writable [fuse_out_header | out-args]; Virtio 1.2 §5.11),
-// and a read-only mount closure: Init, Lookup, GetAttr, Open, Read,
-// Release, Forget, Destroy. Write-side FUSE ops are out of scope.
+// and a read-write mount closure: Init, Lookup, GetAttr, Open/OpenRW,
+// Read, Write, Create, Mkdir, Mknod, Symlink, Link, SetAttr, Unlink,
+// Rmdir, Rename, Fsync, Flush, Release, Forget, Destroy. FUSE_WRITE
+// carries its data in an extra readable descriptor (a three-region
+// chain); every other op keeps the two-region read/write split.
 //
 //   - Modern transport (VIRTIO_F_VERSION_1 mandatory). Legacy devices
 //     are rejected by the common init sequence.
 //   - Queue 0 is the hiprio queue; queues 1..num_request_queues are the
 //     request queues (Virtio 1.2 §5.11.2). This driver issues all FUSE
 //     requests on the first request queue (index 1) and does not use the
-//     hiprio queue (no FUSE_INTERRUPT / FUSE_FORGET fast-path needed for
-//     a read-only mount).
+//     hiprio queue (no FUSE_INTERRUPT / FUSE_FORGET fast-path needed
+//     here; FUSE_FORGET is submitted on the request queue).
 //   - No virtio feature bit beyond VIRTIO_F_VERSION_1 is negotiated.
 //     (VIRTIO_FS_F_NOTIFICATION exists but is not required for the
 //     request path.)
@@ -85,17 +88,53 @@ const (
 	virtioFSCfgLength uint32 = 40
 )
 
-// FUSE opcodes (Linux fuse.h: enum fuse_opcode). Only the read-only
-// mount subset is defined.
+// FUSE opcodes (Linux fuse.h: enum fuse_opcode). The read-only mount
+// subset plus the read-write closure.
 const (
 	FuseOpLookup  uint32 = 1
 	FuseOpForget  uint32 = 2
 	FuseOpGetattr uint32 = 3
+	FuseOpSetattr uint32 = 4
+	FuseOpSymlink uint32 = 6
+	FuseOpMknod   uint32 = 8
+	FuseOpMkdir   uint32 = 9
+	FuseOpUnlink  uint32 = 10
+	FuseOpRmdir   uint32 = 11
+	FuseOpRename  uint32 = 12
+	FuseOpLink    uint32 = 13
 	FuseOpOpen    uint32 = 14
 	FuseOpRead    uint32 = 15
+	FuseOpWrite   uint32 = 16
 	FuseOpRelease uint32 = 18
+	FuseOpFsync   uint32 = 20
+	FuseOpFlush   uint32 = 25
 	FuseOpInit    uint32 = 26
+	FuseOpCreate  uint32 = 35
 	FuseOpDestroy uint32 = 38
+)
+
+// FUSE_SETATTR valid-mask bits (Linux fuse.h: FATTR_*). The `valid`
+// field of fuse_setattr_in selects which attributes the request changes.
+const (
+	FattrMode     uint32 = 1 << 0  // FATTR_MODE      (chmod)
+	FattrUID      uint32 = 1 << 1  // FATTR_UID       (chown user)
+	FattrGID      uint32 = 1 << 2  // FATTR_GID       (chown group)
+	FattrSize     uint32 = 1 << 3  // FATTR_SIZE      (truncate)
+	FattrAtime    uint32 = 1 << 4  // FATTR_ATIME     (utimes access)
+	FattrMtime    uint32 = 1 << 5  // FATTR_MTIME     (utimes modify)
+	FattrFh       uint32 = 1 << 6  // FATTR_FH        (fh field valid)
+	FattrAtimeNow uint32 = 1 << 7  // FATTR_ATIME_NOW
+	FattrMtimeNow uint32 = 1 << 8  // FATTR_MTIME_NOW
+	FattrCtime    uint32 = 1 << 10 // FATTR_CTIME
+)
+
+// Open-flag values for Open/OpenRW/Create (the POSIX open(2) access
+// modes, Linux asm-generic/fcntl.h: O_RDONLY/O_WRONLY/O_RDWR). FUSE
+// passes them through verbatim in fuse_open_in.flags / fuse_create_in.flags.
+const (
+	OpenReadOnly  uint32 = 0 // O_RDONLY
+	OpenWriteOnly uint32 = 1 // O_WRONLY
+	OpenReadWrite uint32 = 2 // O_RDWR
 )
 
 // On-the-wire sizes of the FUSE structs the driver builds or parses
@@ -154,6 +193,58 @@ const (
 	// fuse_attr_out{ le64 attr_valid; le32 attr_valid_nsec,dummy;
 	//   struct fuse_attr attr; } = 8 + 4 + 4 + 92 = 108.
 	fuseAttrOutSize = 108
+
+	// fuse_write_in{ le64 fh; le64 offset; le32 size; le32 write_flags;
+	//   le64 lock_owner; le32 flags; le32 padding; } = 8+8+4+4+8+4+4 = 40.
+	fuseWriteInSize = 40
+
+	// fuse_write_out{ le32 size; le32 padding; } = 8.
+	fuseWriteOutSize = 8
+
+	// fuse_create_in{ le32 flags; le32 mode; le32 umask; le32 open_flags; }
+	// = 16.
+	fuseCreateInSize = 16
+
+	// fuse_mkdir_in{ le32 mode; le32 umask; } = 8.
+	fuseMkdirInSize = 8
+
+	// fuse_setattr_in{ le32 valid; le32 padding; le64 fh; le64 size;
+	//   le64 lock_owner; le64 atime; le64 mtime; le64 ctime;
+	//   le32 atimensec; le32 mtimensec; le32 ctimensec; le32 mode;
+	//   le32 unused4; le32 uid; le32 gid; le32 unused5; }
+	// = 4+4 + 6*8 + 8*4 = 8+48+32 = 88.
+	fuseSetattrInSize = 88
+
+	// fuse_rename_in{ le64 newdir; } = 8 (followed by oldname\0newname\0).
+	fuseRenameInSize = 8
+
+	// fuse_fsync_in{ le64 fh; le32 fsync_flags; le32 padding; } = 16.
+	fuseFsyncInSize = 16
+
+	// fuse_flush_in{ le64 fh; le32 unused; le32 padding; le64 lock_owner; }
+	// = 24.
+	fuseFlushInSize = 24
+
+	// fuse_mknod_in{ le32 mode; le32 rdev; le32 umask; le32 padding; } = 16.
+	fuseMknodInSize = 16
+
+	// fuse_link_in{ le64 oldnodeid; } = 8 (followed by newname\0).
+	fuseLinkInSize = 8
+)
+
+// fuse_setattr_in field offsets inside the 88-byte struct (Linux
+// fuse.h). valid@0, padding@4, fh@8, size@16, lock_owner@24, atime@32,
+// mtime@40, ctime@48, atimensec@56, mtimensec@60, ctimensec@64, mode@68,
+// unused4@72, uid@76, gid@80, unused5@84.
+const (
+	setattrValidOffset = 0
+	setattrFhOffset    = 8
+	setattrSizeOffset  = 16
+	setattrAtimeOffset = 32
+	setattrMtimeOffset = 40
+	setattrModeOffset  = 68
+	setattrUIDOffset   = 76
+	setattrGIDOffset   = 80
 )
 
 // fuse_attr field offsets inside the 92-byte struct (Linux fuse.h),
@@ -171,6 +262,31 @@ const (
 	attrModeOffset  = 60
 	attrNlinkOffset = 64
 )
+
+// FUSE_INIT flag bits (Linux fuse.h: FUSE_*), the protocol-level feature
+// handshake carried in fuse_init_in.flags / fuse_init_out.flags
+// (independent of the virtio feature bits). The read-write closure
+// proposes the two that affect write semantics:
+//
+//   - FUSE_BIG_WRITES (1<<5): the kernel/guest may send writes larger
+//     than one page. virtiofsd assumes it at FUSE 7.x; we set it so the
+//     Write op is permitted to carry multi-page data regions.
+//   - FUSE_ATOMIC_O_TRUNC (1<<3): O_TRUNC is handled atomically by the
+//     OPEN/CREATE op itself (no separate SETATTR-size-0). Required for a
+//     correct OpenRW(...O_TRUNC)/Create truncating open.
+//
+// FUSE_WRITEBACK_CACHE (1<<16) is deliberately NOT negotiated: it shifts
+// page-cache writeback responsibility to the kernel and is a host/guest
+// page-cache optimization this raw request driver does not implement.
+const (
+	FuseBigWrites     uint32 = 1 << 5  // FUSE_BIG_WRITES
+	FuseAtomicOTrunc  uint32 = 1 << 3  // FUSE_ATOMIC_O_TRUNC
+	FuseWritebackCach uint32 = 1 << 16 // FUSE_WRITEBACK_CACHE (not negotiated)
+)
+
+// FuseInitFlags is the fuse_init_in.flags mask the driver proposes (the
+// device intersects it with its own). Only write-relevant bits are set.
+const FuseInitFlags uint32 = FuseBigWrites | FuseAtomicOTrunc
 
 // AcceptedFeatures is the feature mask the driver negotiates ON — only
 // the non-negotiable VIRTIO_F_VERSION_1.
@@ -224,6 +340,11 @@ type VirtioFS struct {
 	// (populated by Init).
 	FuseMajor uint32
 	FuseMinor uint32
+
+	// FuseFlags records the negotiated FUSE_INIT flags (the intersection
+	// of FuseInitFlags and the device-offered fuse_init_out.flags),
+	// populated by Init.
+	FuseFlags uint32
 
 	// unique is the running FUSE request id (fuse_in_header.unique),
 	// monotonically increasing per request (Linux fuse.h).
