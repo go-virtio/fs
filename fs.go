@@ -182,17 +182,18 @@ const (
 
 	// fuse_attr{ le64 ino,size,blocks,atime,mtime,ctime; le32 atimensec,
 	//   mtimensec,ctimensec,mode,nlink,uid,gid,rdev,blksize,flags; }
-	// = 6*8 + 11*4 = 92.
-	fuseAttrSize = 92
+	// = 6*8 + 10*4 = 88. (10 le32 fields, not 11 — confirmed against a real
+	// virtiofsd, which sends an 88-byte fuse_attr; the prior 92 mis-parsed it.)
+	fuseAttrSize = 88
 
 	// fuse_entry_out{ le64 nodeid,generation,entry_valid,attr_valid;
 	//   le32 entry_valid_nsec,attr_valid_nsec; struct fuse_attr attr; }
-	// = 4*8 + 2*4 + 92 = 132.
-	fuseEntryOutSize = 132
+	// = 4*8 + 2*4 + 88 = 128.
+	fuseEntryOutSize = 128
 
 	// fuse_attr_out{ le64 attr_valid; le32 attr_valid_nsec,dummy;
-	//   struct fuse_attr attr; } = 8 + 4 + 4 + 92 = 108.
-	fuseAttrOutSize = 108
+	//   struct fuse_attr attr; } = 8 + 4 + 4 + 88 = 104.
+	fuseAttrOutSize = 104
 
 	// fuse_write_in{ le64 fh; le64 offset; le32 size; le32 write_flags;
 	//   le64 lock_owner; le32 flags; le32 padding; } = 8+8+4+4+8+4+4 = 40.
