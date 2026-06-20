@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-virtio/brand/main/social/go-virtio-fs.png" alt="go-virtio/fs" width="720"></p>
+
 # go-virtio/fs
 
 Pure-Go virtio-fs (FUSE-over-virtio) guest driver targeting the
