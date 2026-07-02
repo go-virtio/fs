@@ -2,6 +2,10 @@
 
 # go-virtio/fs
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-virtio/fs.svg)](https://pkg.go.dev/github.com/go-virtio/fs)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-virtio/fs/actions/workflows/ci.yml/badge.svg)](https://github.com/go-virtio/fs/actions/workflows/ci.yml)
+
 Pure-Go virtio-fs (FUSE-over-virtio) guest driver targeting the
 `go-virtio/common` transport interfaces. Implements the modern-transport
 (Virtio 1.0+) init sequence, the request virtqueue, and the
