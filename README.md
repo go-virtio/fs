@@ -124,7 +124,7 @@ _ = fs.Release(ne.NodeID, wfh)
 ## Device-ID centralization
 
 Per the org convention, virtio device IDs live in `go-virtio/common`. This
-driver consumes them from `common` v0.1.5, which centralizes
+driver consumes them from `common` v0.1.6, which centralizes
 `DeviceTypeFS` (26), `PCIDeviceIDModernFS` (0x105A) and `PCIDeviceIDIsFS`
 alongside the other `DeviceType*` / `PCIDeviceIDModern*` constants.
 
